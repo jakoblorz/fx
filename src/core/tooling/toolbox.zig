@@ -117,7 +117,8 @@ const not_run_keys = [_][]const u8{ "open", "search", "resource", "server", "off
 /// also opens or searches, so that call reaches decode and gets its reason.
 pub fn carriedCall(arena: Allocator, name: []const u8, arguments_json: []const u8) Allocator.Error!?Carried {
     if (!std.mem.eql(u8, name, tool_name)) return null;
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments_json, .{}) catch |err| switch (err) {
+    // Carry the caller's numbers without rounding metadata through floats.
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments_json, .{ .parse_numbers = false }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
@@ -151,6 +152,13 @@ test "only a call that is just a run is carried, so any other reaches the tool's
     try std.testing.expectEqualStrings("mcp_fixture_echo", carried.name);
     try std.testing.expectEqualStrings("{\"text\":\"hi\"}", carried.arguments_json);
     try std.testing.expectEqualStrings("{}", (try carriedCall(arena, tool_name, "{\"run\":\"mcp_fixture_echo\"}")).?.arguments_json);
+}
+
+test "memory numeric arguments stay exact when carried through toolbox" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const carried = (try carriedCall(arena_state.allocator(), tool_name, "{\"run\":\"query_memory\",\"arguments\":{\"query\":{\"n\":0.10000000000000001,\"large\":9007199254740993}}}")).?;
+    try std.testing.expectEqualStrings("{\"query\":{\"n\":0.10000000000000001,\"large\":9007199254740993}}", carried.arguments_json);
 }
 
 test "an open of a skill named like a tool or server is decided as the skill, unless kind says otherwise" {

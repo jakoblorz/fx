@@ -31,6 +31,10 @@ const NO_SAVE_TOOLS = [
   "ask_user_question",
   "web_fetch",
   "exa_search",
+  "write_memory",
+  "list_memory",
+  "read_memory",
+  "query_memory",
   "read_tool_result",
   // The gateway adds fx's vision tool for models without native image input.
   "vision",

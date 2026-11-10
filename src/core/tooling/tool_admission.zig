@@ -408,6 +408,10 @@ pub fn prepareFileMutationCall(
     var input_owned = true;
     defer if (input_owned) input.deinit(alloc);
 
+    if (try file_mutation.validateMemoryMutationPath(alloc, request.workspace_root, input.path())) |reason| {
+        return .{ .tool_failure = reason };
+    }
+
     if (builtin.is_test) file_mutation_resolution_count += 1;
     var targets = switch (try permissions.prepareFileMutationTargets(
         alloc,

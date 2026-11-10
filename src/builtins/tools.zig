@@ -26,6 +26,7 @@ const install_skill_impl = @import("../tools/skills/install_skill.zig");
 const toolbox_impl = @import("../tools/capabilities/toolbox.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
+const memory_impl = @import("../tools/memory/memory.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -671,6 +672,55 @@ pub const read_tool_result = ToolSpec{
     .irreversible_fn = read_tool_result_impl.isIrreversible,
 };
 
+const memory_metadata_schema = model_tool_schema.ObjectSchema{ .additional_properties = true };
+
+fn memoryTool(comptime operation: memory_impl.Operation, comptime name: []const u8, comptime description: []const u8, comptime schema: model_tool_schema.ObjectSchema) ToolSpec {
+    const Impl = memory_impl.Tool(operation);
+    return .{
+        .name = name,
+        .description = description,
+        .model_schema = .{ .name = name, .description = description, .input_schema = schema },
+        .executor_kind = switch (operation) {
+            .write => .write_memory,
+            .list => .list_memory,
+            .read => .read_memory,
+            .query => .query_memory,
+        },
+        .activity_kind = if (operation == .write) .write else if (operation == .list) .list else .read,
+        .requires_approval = operation == .write,
+        .action_label = if (operation == .write) "Writing" else if (operation == .query) "Querying" else if (operation == .list) "Listing" else "Reading",
+        .completed_action_label = if (operation == .write) "Wrote" else if (operation == .query) "Queried" else if (operation == .list) "Listed" else "Read",
+        .label_arg_default = "memory",
+        .permission_target_kind = .none,
+        .decode = Impl.decode,
+        .validate = Impl.validate,
+        .call = Impl.call,
+        .reads_only_fn = Impl.readsOnly,
+        .irreversible_fn = Impl.isIrreversible,
+    };
+}
+
+pub const write_memory = memoryTool(.write, "write_memory", "Create or overwrite a Markdown memory in the profile's memory directory (~/.fx/memory by default). Pass body content without existing frontmatter. Optional frontmatter is a flat object of strings, numbers, booleans, nulls, or arrays of those scalars; nested objects and arrays are rejected. It is encoded as YAML automatically. Use this tool, not write_file or edit_file, to write memories.", .{
+    .properties = &.{
+        .{ .name = "content", .json_type = .string, .description = "Markdown body without a frontmatter block." },
+        .{ .name = "filename", .json_type = .string, .description = "A single filename, optionally ending in .md; no directories." },
+        .{ .name = "frontmatter", .json_type = .object, .shape = &.{ .object = &memory_metadata_schema }, .description = "Optional flat YAML metadata. Arrays may contain only scalar values." },
+    },
+    .required = &.{ "content", "filename" },
+    .additional_properties = false,
+});
+pub const list_memory = memoryTool(.list, "list_memory", "List the profile's Markdown memory filenames in sorted order. Takes no parameters; an absent memory directory returns an empty list.", .{ .additional_properties = false });
+pub const read_memory = memoryTool(.read, "read_memory", "Read a Markdown memory by filename. Returns the entire file, including YAML frontmatter.", .{
+    .properties = &.{.{ .name = "filename", .json_type = .string, .description = "A single filename, optionally ending in .md; no directories." }},
+    .required = &.{"filename"},
+    .additional_properties = false,
+});
+pub const query_memory = memoryTool(.query, "query_memory", "Return sorted memory filenames whose YAML frontmatter matches every query key. A null query value requires only that the key exists. Other query values must be single strings, numbers, or booleans: they must equal the stored scalar or occur in its scalar array. Types must match; strings do not match numbers or booleans. An empty query matches all Markdown memories.", .{
+    .properties = &.{.{ .name = "query", .json_type = .object, .shape = &.{ .object = &memory_metadata_schema }, .description = "All keys must match. Null tests key existence; other values test equality or array membership." }},
+    .required = &.{"query"},
+    .additional_properties = false,
+});
+
 pub const all = [_]tool_dispatch.Tool{
     glob_files,
     grep_files,
@@ -686,6 +736,10 @@ pub const all = [_]tool_dispatch.Tool{
     vision,
     read_tool_result,
     toolbox,
+    write_memory,
+    list_memory,
+    read_memory,
+    query_memory,
 };
 
 /// fx's own tools. libfx's Node-API addon never runs them, because its agents
@@ -768,12 +822,19 @@ pub const advertisement_order = [_][]const u8{
     "ask_user_question",
     "web_fetch",
     "web_search",
+    "write_memory",
+    "list_memory",
+    "read_memory",
+    "query_memory",
 };
 
 pub const read_only_tool_names = [_][]const u8{
     "read_file",
     "glob_files",
     "grep_files",
+    "list_memory",
+    "read_memory",
+    "query_memory",
 };
 
 pub fn isReadOnlyToolName(name: []const u8) bool {
@@ -839,9 +900,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "9c769118b4f20c09973c328171d3023dacc352be40b29d6d0573efe857628a4a"
+            "b43cd9b6ac5b32cd961c4a57b1eb9b89d4c75959e15d38390ed31309585df217"
         else
-            "ebb9ef710340e303e1e265aacbc7b7eb908c3624909a8c5faa0691b2aac2e50b",
+            "0979699ea8113dfc959ef967bd445d43767c0157adbfd2ae6ed550b4e9a952e3",
         &actual_hex,
     );
 }
@@ -905,6 +966,10 @@ test "built-in tools register exact active local order" {
         "vision",
         "read_tool_result",
         "toolbox",
+        "write_memory",
+        "list_memory",
+        "read_memory",
+        "query_memory",
     };
 
     try std.testing.expectEqual(expected_names.len, all.len);
@@ -1613,6 +1678,9 @@ test "built-in read-only tool set matches plan inspection tools" {
         "read_file",
         "glob_files",
         "grep_files",
+        "list_memory",
+        "read_memory",
+        "query_memory",
     };
 
     try std.testing.expectEqual(expected_names.len, read_only_tool_names.len);
@@ -1674,4 +1742,38 @@ test "every built-in tool but toolbox, the tools it replaces, and vision can mov
         try std.testing.expect(found);
     }
     for (toolbox_core.default_behind) |name| try std.testing.expect(tool_placement.Tool.parse(name) != null);
+}
+
+test "memory tools use injected storage and permission gate" {
+    const memory_store = @import("../core/memory/memory.zig");
+    const io_mod = @import("../core/shared/io.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = memory_store.Native.init(home);
+    var ctx = tool_dispatch.DispatchContext{ .allocator = alloc, .memory_provider = store.provider(), .permission_mode = .ask };
+    const call = types.ToolCall{ .id = "memory-permission", .name = "write_memory", .arguments_json = "{\"filename\":\"note\",\"content\":\"body\",\"frontmatter\":{\"n\":0.10000000000000001}}" };
+    const denied = try tool_dispatch.dispatchToolCall(ctx, registry, call);
+    defer denied.deinit(alloc);
+    try std.testing.expectEqual(.failure, denied.status);
+    const names = try store.provider().list(alloc);
+    defer memory_store.freeNames(alloc, names);
+    try std.testing.expectEqual(@as(usize, 0), names.len);
+    ctx.permission_mode = .yolo;
+    const written = try tool_dispatch.dispatchToolCall(ctx, registry, call);
+    defer written.deinit(alloc);
+    try std.testing.expectEqual(.success, written.status);
+    ctx.permission_mode = .ask;
+    const read = try tool_dispatch.dispatchToolCall(ctx, registry, .{ .id = "memory-read", .name = "read_memory", .arguments_json = "{\"filename\":\"note\"}" });
+    defer read.deinit(alloc);
+    try std.testing.expectEqual(.success, read.status);
+    try std.testing.expect(std.mem.find(u8, read.body, "0.10000000000000001") != null);
+    const queried = try tool_dispatch.dispatchToolCall(ctx, registry, .{ .id = "memory-query", .name = "query_memory", .arguments_json = "{\"query\":{\"n\":0.10000000000000001}}" });
+    defer queried.deinit(alloc);
+    try std.testing.expectEqualStrings("[\"note.md\"]", queried.body);
+    const mismatch = try tool_dispatch.dispatchToolCall(ctx, registry, .{ .id = "memory-mismatch", .name = "query_memory", .arguments_json = "{\"query\":{\"n\":0.1}}" });
+    defer mismatch.deinit(alloc);
+    try std.testing.expectEqualStrings("[]", mismatch.body);
 }

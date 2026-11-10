@@ -1,5 +1,6 @@
 const std = @import("std");
 const file_mutation_contract = @import("../../core/tooling/file_mutation_contract.zig");
+const file_mutation = @import("../../core/tooling/file_mutation.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
 
@@ -91,7 +92,7 @@ pub fn validate(
             "edit_file failed: new_string exceeds the 4 MiB preparation limit",
         );
     }
-    return null;
+    return file_mutation.validateMemoryMutationPath(ctx.allocator, ctx.workspace_root, input.path);
 }
 
 pub fn call(

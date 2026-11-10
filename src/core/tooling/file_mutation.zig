@@ -6,6 +6,7 @@ const file_mutation_contract = @import("file_mutation_contract.zig");
 const io_mod = @import("../shared/io.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const pathing = @import("../workspace/pathing.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 
@@ -150,6 +151,68 @@ const total_content_too_large_message = std.fmt.comptimePrint(
 );
 const mib = 1024 * 1024;
 
+const memory_mutation_message = "Generic file tools cannot modify the profile memory directory. Use write_memory to save or update memory.";
+const memory_resolution_message = "Cannot verify the profile memory directory for a generic file mutation. Use write_memory to save or update memory.";
+
+/// Rejects generic writes and edits to the active profile's memory directory.
+/// The caller owns the returned failure message. This performs no writes.
+pub fn validateMemoryMutationPath(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    raw_path: []const u8,
+) Allocator.Error!?[]u8 {
+    const home = io_mod.homeDir();
+    if (home == null and !profile_paths.fxHomeActive()) return null;
+    const memory_root = try profile_paths.rootPath(alloc, home orelse "", &.{"memory"});
+    defer alloc.free(memory_root);
+    return validateMemoryMutationPathAtRoot(alloc, workspace_root, raw_path, memory_root);
+}
+
+fn validateMemoryMutationPathAtRoot(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    raw_path: []const u8,
+    memory_root: []const u8,
+) Allocator.Error!?[]u8 {
+    // Create-mode resolution protects the boundary even before the memory
+    // folder or any child exists, and follows final symlinks as well as parents.
+    const canonical_root = canonicalMemoryGuardPath(alloc, workspace_root, memory_root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return try alloc.dupe(u8, memory_resolution_message),
+    };
+    defer alloc.free(canonical_root);
+    const canonical_target = canonicalMemoryGuardPath(alloc, workspace_root, raw_path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Normal target-resolution failures are reported by tool admission.
+        else => return null,
+    };
+    defer alloc.free(canonical_target);
+    if (std.mem.eql(u8, canonical_target, canonical_root) or
+        (std.mem.startsWith(u8, canonical_target, canonical_root) and
+            canonical_target.len > canonical_root.len and canonical_target[canonical_root.len] == std.Io.Dir.path.sep))
+    {
+        return try alloc.dupe(u8, memory_mutation_message);
+    }
+    return null;
+}
+
+fn canonicalMemoryGuardPath(alloc: Allocator, workspace_root: []const u8, raw_path: []const u8) ![]u8 {
+    const cleaned = std.mem.trim(u8, raw_path, " \t\r\n");
+    // An absolute spelling lets the resolver follow workspace symlinks before
+    // its workspace containment check. Admission still enforces containment.
+    const absolute = if (std.Io.Dir.path.isAbsolute(cleaned) or std.mem.startsWith(u8, cleaned, "~"))
+        try alloc.dupe(u8, cleaned)
+    else blk: {
+        if (workspace_root.len == 0) return error.WorkspaceUnavailable;
+        break :blk try std.Io.Dir.path.resolveAlloc(alloc, &.{ workspace_root, cleaned });
+    };
+    defer alloc.free(absolute);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const resolved = try pathing.resolveWorkspaceOrExternalCreatePath(arena_state.allocator(), workspace_root, absolute);
+    return alloc.dupe(u8, resolved);
+}
+
 const FileMutationPrepareError = error{
     OutOfMemory,
     Canceled,
@@ -232,6 +295,10 @@ fn prepareInternal(
     }
     if (verify_target_resolution and !try resolvedTargetMatches(input, policy_targets)) {
         return .{ .semantic_failure = target_mismatch_message };
+    }
+
+    if (try validateMemoryMutationPath(call_alloc, "/", policy_targets.canonical_target_path)) |reason| {
+        return .{ .semantic_failure = reason };
     }
 
     const preimage_result = try verifyAndReadPreimage(call_alloc, input, policy_targets);
@@ -2091,6 +2158,77 @@ fn expectNoStageFiles(root: []const u8) !void {
     while (try walker.next(std.testing.io)) |entry| {
         try std.testing.expect(std.mem.find(u8, entry.path, ".fx-stage-") == null);
     }
+}
+
+test "memory mutation guard blocks the directory and descendants without writes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    try tmp.dir.createDirPath(std.testing.io, "profile/memory");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "profile/memory/note.md", .data = "keep me" });
+    const memory_root = try std.Io.Dir.path.join(arena, &.{ root, "profile/memory" });
+    for ([_][]const u8{
+        memory_root,
+        "profile/memory",
+        "profile/memory/note.md",
+        "profile/memory/new/note.md",
+        "profile/memory/../memory/./note.md",
+    }) |target| {
+        const reason = (try validateMemoryMutationPathAtRoot(arena, root, target, memory_root)) orelse return error.ExpectedMemoryGuard;
+        try std.testing.expectEqualStrings(memory_mutation_message, reason);
+    }
+    for ([_][]const u8{ "profile/memory-other/note.md", "profile/memory.md", "note.md" }) |target| {
+        try std.testing.expect(try validateMemoryMutationPathAtRoot(arena, root, target, memory_root) == null);
+    }
+    const original = try readTestFile(arena, &tmp, "profile/memory/note.md");
+    try std.testing.expectEqualStrings("keep me", original);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "profile/memory/new", .{}));
+    try expectNoStageFiles(root);
+}
+
+test "memory mutation guard protects a missing profile memory root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const memory_root = try std.Io.Dir.path.join(arena, &.{ root, "missing-profile/memory" });
+    for ([_][]const u8{ memory_root, "missing-profile/memory/a/b.md" }) |target| {
+        const reason = (try validateMemoryMutationPathAtRoot(arena, root, target, memory_root)) orelse return error.ExpectedMemoryGuard;
+        try std.testing.expectEqualStrings(memory_mutation_message, reason);
+    }
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "missing-profile", .{}));
+    try expectNoStageFiles(root);
+}
+
+test "memory mutation guard follows target and profile symlink aliases including dangling aliases" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    try tmp.dir.createDirPath(std.testing.io, "store/memory");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "store/memory/note.md", .data = "keep me" });
+    try tmp.dir.symLink(std.testing.io, "store", "profile", .{ .is_directory = true });
+    try tmp.dir.symLink(std.testing.io, "store/memory", "alias", .{ .is_directory = true });
+    try tmp.dir.symLink(std.testing.io, "store/memory/note.md", "file-alias", .{});
+    try tmp.dir.symLink(std.testing.io, "store/memory/missing", "dangling-alias", .{ .is_directory = true });
+    const memory_root = try std.Io.Dir.path.join(arena, &.{ root, "profile/memory" });
+    for ([_][]const u8{ "alias", "alias/note.md", "alias/new/note.md", "file-alias", "dangling-alias/note.md", "store/memory/note.md" }) |target| {
+        const reason = (try validateMemoryMutationPathAtRoot(arena, root, target, memory_root)) orelse return error.ExpectedMemoryGuard;
+        try std.testing.expectEqualStrings(memory_mutation_message, reason);
+    }
+    const original = try readTestFile(arena, &tmp, "store/memory/note.md");
+    try std.testing.expectEqualStrings("keep me", original);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "store/memory/missing", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "store/memory/new", .{}));
+    try expectNoStageFiles(root);
 }
 
 test "prepare derives a missing write without creating the target" {

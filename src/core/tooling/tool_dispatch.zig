@@ -36,6 +36,7 @@ const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_contracts = @import("../terminal/contracts.zig");
 const tool_args = @import("tool_args.zig");
 const result_commit = @import("result_commit.zig");
+const memory_store = @import("../memory/memory.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -288,6 +289,8 @@ pub const DispatchContext = struct {
     subagent_provider: ?subagent_tool_provider.Provider = null,
     vision_provider: ?VisionProvider = null,
     host_tool_provider: ?HostToolProvider = null,
+    /// Optional host-owned memory store; native tools use the profile store otherwise.
+    memory_provider: ?memory_store.Provider = null,
     ask_question_ctx: ?*anyopaque = null,
     observer: ?*observation.Observer = null,
     ask_question_batch: ?AskQuestionBatchFn = null,
@@ -413,6 +416,10 @@ pub const ExecutorKind = enum {
     grep_files,
     read_file,
     read_tool_result,
+    write_memory,
+    list_memory,
+    read_memory,
+    query_memory,
     write_file,
     edit_file,
     web_fetch,

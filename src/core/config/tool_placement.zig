@@ -35,6 +35,10 @@ pub const Tool = enum {
     subagent,
     ask_user_question,
     read_tool_result,
+    write_memory,
+    list_memory,
+    read_memory,
+    query_memory,
 
     pub fn parse(name: []const u8) ?Tool {
         return std.meta.stringToEnum(Tool, name);

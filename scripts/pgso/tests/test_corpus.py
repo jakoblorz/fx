@@ -54,6 +54,7 @@ TRAINING_E2E_TESTS = (
 )
 
 VERIFICATION_E2E_TESTS = (
+    "memory.test.ts",
     "slack-install.test.ts",
     "auto-mode-reliability.test.ts",
     "sessions.test.ts",
@@ -382,7 +383,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(69, len(corpus.candidate_scenarios))
+        self.assertEqual(70, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,
