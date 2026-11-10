@@ -3711,6 +3711,9 @@ test "gateway_system_prompt: persistent memory" {
 }
 
 test "gateway_system_prompt: feature branch lifecycle" {
+    try expectDefaultPromptContains("A single session may switch between multiple PRs, but only when the user asks.");
+    try expectDefaultPromptContains("Never proactively switch projects or repositories.");
+    try expectDefaultPromptContains("Creating a worktree for the requested task does not authorize unrelated work.");
     try expectDefaultPromptContains("inspect the branch, tracking remote, worktrees, and PR state before editing");
     try expectDefaultPromptContains("commit and push your verified changes before returning");
     try expectDefaultPromptContains("Unless the user says otherwise");
