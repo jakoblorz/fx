@@ -109,6 +109,7 @@ pub const UserSettingsPatch = struct {
     ultrafast_mode: ?bool = null,
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
+    container_tools: ?bool = null,
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
@@ -145,6 +146,7 @@ pub const UserSettingsPatch = struct {
             self.ultrafast_mode == null and
             self.slash_menu_categories == null and
             self.collapse_tool_calls == null and
+            self.container_tools == null and
             self.update_channel == null and
             self.startup_scrollback == null and
             self.prompt_history_enabled == null and
@@ -1284,6 +1286,17 @@ fn applyUserPatchToRoot(
     if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
     if (patch.session_titles) |value| application.changed = try putBool(arena, &root.object, "session_titles", value) or application.changed;
 
+    if (patch.container_tools) |enabled| {
+        const experimental = if (root.object.getPtr("experimental")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk value;
+        } else blk: {
+            try root.object.put(arena, "experimental", .{ .object = .empty });
+            break :blk root.object.getPtr("experimental").?;
+        };
+        application.changed = try putBool(arena, &experimental.object, "container_tools", enabled) or application.changed;
+    }
+
     if (patch.prompt_history_enabled) |enabled| {
         var prompt_history = if (root.object.getPtr("prompt_history")) |value| blk: {
             if (value.* != .object) return error.InvalidSettingsFormat;
@@ -1505,7 +1518,7 @@ fn cleanupLegacyWorkspacePreferences(
 
 /// The settings paths a patch from `fx config set` or `unset` writes that the
 /// `/settings` cleanup above doesn't already cover.
-fn configWrittenPaths(patch: UserSettingsPatch) [9]?[]const u8 {
+fn configWrittenPaths(patch: UserSettingsPatch) [10]?[]const u8 {
     return .{
         if (patch.theme != null) "theme" else null,
         if (patch.auto_upgrade != null) "auto_upgrade" else null,
@@ -1515,6 +1528,7 @@ fn configWrittenPaths(patch: UserSettingsPatch) [9]?[]const u8 {
         if (patch.provider_strict != null) "provider_strict" else null,
         if (patch.context != null) "context" else null,
         if (patch.cache_warming != null) "cache_warming" else null,
+        if (patch.container_tools != null) "experimental.container_tools" else null,
         patch.remove,
     };
 }
@@ -4628,4 +4642,22 @@ test "workspace directory add compacts saved aliases before applying effective c
     defer alloc.free(retained_identity);
     try std.testing.expectEqualStrings(shared, retained_identity);
     try std.testing.expectEqualStrings(added, directories[1].string);
+}
+
+test "container tools patch writes nested experiment and removes workspace copies" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"workspaces\":{\"/workspace\":{\"experimental\":{\"container_tools\":false}}}}", .{});
+    defer parsed.deinit();
+    var root = parsed.value;
+    try std.testing.expect(!(UserSettingsPatch{ .container_tools = true }).isEmpty());
+    const applied = try applyUserPatchToRoot(alloc, &root, .{ .container_tools = true });
+    try std.testing.expect(applied.changed);
+    try std.testing.expect(root.object.get("experimental").?.object.get("container_tools").?.bool);
+    try std.testing.expect(root.object.get("container_tools") == null);
+    try std.testing.expect(root.object.get("workspaces").?.object.get("/workspace") == null);
+    const removed = try applyUserPatchToRoot(alloc, &root, .{ .remove = "experimental.container_tools" });
+    try std.testing.expect(removed.changed);
+    try std.testing.expect(root.object.get("experimental") == null);
 }

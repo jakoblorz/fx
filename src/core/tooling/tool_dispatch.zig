@@ -253,6 +253,8 @@ pub const DispatchContext = struct {
     execution_authority: ?command_admission.ToolExecutionAuthority = null,
     workspace_root: []const u8 = "",
     access_scope: ?workspace_access.AccessScope = null,
+    /// Container domains never execute through generic host dispatch.
+    container_tools: bool = false,
     ignored_list_entries: []const []const u8 = &default_ignored_list_entries,
     max_list_entries: usize = default_max_list_entries,
     max_read_file_bytes: usize = default_max_read_file_bytes,
@@ -944,6 +946,7 @@ pub const AuthorizedDispatchResult = struct {
 
 /// Runs one model-requested tool call through lookup, validation, gate, and call.
 pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.ToolCall) DispatchError!DispatchResult {
+    if (ctx.container_tools) return failure(try ctx.allocator.dupe(u8, "Container tools cannot execute through host dispatch."));
     var captured_usage: ?core_types.ToolUsage = null;
     var captured_web_search_completion: ?core_types.WebSearchCompletion = null;
     var captured_web_fetch_completion: ?core_types.WebFetchCompletion = null;
@@ -997,6 +1000,7 @@ pub fn dispatchAuthorizedToolCall(
     registry: Registry,
     call: message.ToolCall,
 ) DispatchError!AuthorizedDispatchResult {
+    if (ctx.container_tools) return .{ .status = .failure, .body = try ctx.allocator.dupe(u8, "Container tools cannot execute through authorized host dispatch.") };
     const validated = try decodeAndValidateRegisteredToolCall(ctx, registry, call);
     switch (validated) {
         .not_registered => return .{ .status = .failure, .body = try ctx.allocator.print("unknown tool: {s}", .{call.name}) },

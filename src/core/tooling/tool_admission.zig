@@ -35,6 +35,7 @@ const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
+const sandbox = @import("../sandbox/sandbox.zig");
 const current_branch = @import("../workspace/current_branch.zig");
 
 const Allocator = std.mem.Allocator;
@@ -69,6 +70,7 @@ pub const SessionPermissionStateProvider = struct {
 /// owns, persists, or extends any referenced runtime state.
 pub const Input = struct {
     workspace_root: []const u8,
+    container_tools: bool = false,
     access_scope: ?workspace_access.AccessScope = null,
     permission_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
     permission_grants: []const PermissionGrant,
@@ -1322,6 +1324,9 @@ fn requestPermissionOutcomeResolved(
     permission_mode: PermissionMode,
     local_grants: []const PermissionGrant,
 ) !command_admission.PermissionOutcome {
+    if (input.container_tools and !sandbox.allowsTool(call.name)) {
+        return .{ .tool_failure = try arena.dupe(u8, "Tool unavailable in the container execution domain; no host tool ran.") };
+    }
     if (file_mutation_contract.isToolName(call.name) and
         // A host tool that reuses a reserved name executes through the host
         // executor, not the builtin file mutation, so it follows the ordinary
