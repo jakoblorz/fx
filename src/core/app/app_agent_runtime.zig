@@ -367,6 +367,8 @@ pub fn Runtime(comptime App: type) type {
             var ctx: tool_runtime.Context = .{
                 .workspace_root = workspace.root,
                 .access_scope = workspace.access_scope,
+                .container_tools = if (comptime @hasField(App, "container_tools")) app.container_tools else false,
+                .container_runtime = if (comptime @hasField(App, "container_runtime")) app.container_runtime else null,
                 .ignored_list_entries = ignored_list_entries,
                 .max_list_entries = max_list_entries,
                 .max_read_file_bytes = max_read_file_bytes,
@@ -434,7 +436,9 @@ pub fn Runtime(comptime App: type) type {
                 .session_allocator = app.alloc,
                 .skills_dir = app.skills.dir,
                 .context_limits = if (comptime @hasField(App, "context_limits")) app.context_limits else .{},
-                .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else true,
+                .context_enabled = if (comptime @hasField(App, "container_tools"))
+                    if (app.container_tools) false else if (comptime @hasField(App, "context_enabled")) app.context_enabled else true
+                else if (comptime @hasField(App, "context_enabled")) app.context_enabled else true,
                 .context_registry = app.contextRegistry(),
                 .output_chunk_ctx = @ptrCast(agent),
                 .on_output_chunk = app_callbacks.Bindings(App).onCommandOutputChunk,
@@ -503,6 +507,24 @@ pub fn Runtime(comptime App: type) type {
                 ctx.mcp_access = .{ .servers = .{ .context = @ptrCast(profile), .allows_fn = profileAllowsMcpServer } };
             }
             if (childRun(agent)) |run| applyChildToolContext(app, &ctx, run);
+            if (ctx.container_tools) {
+                ctx.mcp_ctx = null;
+                ctx.mcp_has_tool = null;
+                ctx.mcp_validate_tool = null;
+                ctx.mcp_call_tool = null;
+                ctx.mcp_search_tools = null;
+                ctx.mcp_tool_schema = null;
+                ctx.mcp_snapshot_tool = null;
+                ctx.mcp_input_responder = null;
+                ctx.subagent_host = null;
+                ctx.terminal_client = null;
+                ctx.managed_executions = null;
+                ctx.web_search_backend = null;
+                ctx.web_fetch_runtime = null;
+                ctx.advertised_dynamic_tool_names = &.{};
+                ctx.toolbox_behind = &.{};
+                ctx.toolbox_mcp_servers = &.{};
+            }
             return ctx;
         }
 
@@ -1027,6 +1049,7 @@ pub fn Runtime(comptime App: type) type {
             _ = max_command_output_bytes;
             _ = gateway_retry_count;
             _ = gateway_chat_url;
+            if (comptime @hasField(App, "container_tools")) if (app.container_tools) return;
             try app.contextRegistry().appendDefaultStatic(.{
                 .project_context = modelVisibleProjectContext(app, agent),
             }, arena, messages);
@@ -1057,6 +1080,7 @@ pub fn Runtime(comptime App: type) type {
             _ = max_command_output_bytes;
             _ = gateway_retry_count;
             _ = gateway_chat_url;
+            if (comptime @hasField(App, "container_tools")) if (app.container_tools) return;
             const permission_snapshot = app_permission_runtime.Runtime(App).livePermissionSnapshot(app, agent);
             const host_workspace = appHostWorkspaceInfo(app);
             const workspace = turnWorkspace(app);
@@ -1079,6 +1103,7 @@ pub fn Runtime(comptime App: type) type {
         /// from turn to turn.
         pub fn refreshProjectContext(app: *App, agent: *AppAgent) context_contract.ProviderError!void {
             agent.context_snapshot.deinit(app.alloc);
+            if (comptime @hasField(App, "container_tools")) if (app.container_tools) return;
             if (!app.context_enabled) return;
 
             const workspace = turnWorkspace(app);
@@ -1968,6 +1993,7 @@ const ProjectionBarrier = struct {
 
 const FakeApp = struct {
     alloc: Allocator,
+    container_tools: bool = false,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     workspace_root: []const u8 = "/tmp/workspace",
     auth: auth_runtime.Runtime = .{},
@@ -2926,6 +2952,23 @@ test "app agent runtime appends static and transient context through configured 
     try std.testing.expectEqual(types.ChatRole.system, messages.items[0].role);
     try std.testing.expectEqualStrings("provider static:project context", messages.items[0].content.?);
     try std.testing.expectEqualStrings("provider transient:/tmp/workspace:auto", messages.items[1].content.?);
+}
+
+test "container app suppresses host static and transient runtime context" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+    app.container_tools = true;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    try Runtime(FakeApp).appendStaticContextMessage(&app, app.agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try Runtime(FakeApp).appendTransientRuntimeContextMessage(&app, app.agent(), arena, &messages, &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try std.testing.expectEqual(@as(usize, 0), messages.items.len);
+    const ctx = Runtime(FakeApp).toolContext(&app, app.agent(), &test_ignored_list_entries, 100, 1024, 40, 120, 2048, 2, test_gateway_chat_url);
+    try std.testing.expect(ctx.container_tools);
+    try std.testing.expect(!ctx.context_enabled);
 }
 
 test "app agent runtime prefers active queued project context snapshot" {

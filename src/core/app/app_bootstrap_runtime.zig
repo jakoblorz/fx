@@ -598,6 +598,7 @@ pub fn Runtime(comptime App: type) type {
             app.fast_mode = startup.fast_mode;
             app.input_runtime.slash_menu_categories = startup.slash_menu_categories;
             app.shell.collapse_tool_calls = startup.collapse_tool_calls;
+            if (comptime @hasField(App, "container_tools")) app.container_tools = startup.container_tools;
             app.auto_upgrade_enabled = startup.auto_upgrade;
             app.upgrader.configure_channel(startup.update_channel);
             agent.effort = startup.effort;
@@ -631,12 +632,12 @@ pub fn Runtime(comptime App: type) type {
                 app,
                 app.requested_resume != null,
             );
-            if (comptime @hasDecl(App, "loadMcpHost")) if (deps.load_mcp_host) |load_host| {
+            if (!startup.container_tools) if (comptime @hasDecl(App, "loadMcpHost")) if (deps.load_mcp_host) |load_host| {
                 try app.loadMcpHost(agent, load_host);
             };
 
-            const skills_deferred = try beginStartupSkillsLoad(app);
-            if (!skills_deferred) {
+            const skills_deferred = if (startup.container_tools) false else try beginStartupSkillsLoad(app);
+            if (!startup.container_tools and !skills_deferred) {
                 var loaded = try deps.load_skills(
                     std.heap.c_allocator,
                     app.workspace_root,

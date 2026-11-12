@@ -86,6 +86,8 @@ const test_browser_workspace_tools = if (builtin.is_test)
 else
     struct {};
 const js_host_workspace = @import("../hosts/js_host_workspace.zig");
+const sandbox = @import("../sandbox/sandbox.zig");
+const container_tools = if (builtin.is_test) @import("../../builtins/container_tools.zig") else struct {};
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -133,6 +135,9 @@ pub const Context = struct {
     observer: ?*observation.Observer = null,
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
+    /// Fixed for this execution domain, independent of permission_mode.
+    container_tools: bool = false,
+    container_runtime: ?*sandbox.Runtime = null,
     ignored_list_entries: []const []const u8,
     max_list_entries: usize,
     max_read_file_bytes: usize,
@@ -273,6 +278,7 @@ pub const Context = struct {
         const observer = self.observer orelse if (self.permission_review_turn) |review| review.observer else null;
         var input: tool_admission.Input = .{
             .workspace_root = self.workspace_root,
+            .container_tools = self.container_tools,
             .access_scope = self.access_scope,
             .permission_review_turn = self.permission_review_turn,
             .permission_grants = self.permission_grants,
@@ -374,6 +380,9 @@ fn providerDisablesTool(capabilities: provider_set.Bundle.Capabilities, name: []
 }
 
 pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_contracts.ToolCallValidationResult {
+    if (ctx.container_tools and !sandbox.allowsTool(call.name)) {
+        return .{ .failure = try arena.dupe(u8, "Tool unavailable in the container execution domain; no host tool ran.") };
+    }
     if (providerDisablesTool(ctx.provider_capabilities, call.name)) {
         return .{ .failure = try arena.dupe(u8, "Unsupported tool: vision") };
     }
@@ -406,6 +415,11 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
 }
 
 pub fn checkToolAvailability(ctx: Context, arena: Allocator, call: ToolCall) !?[]const u8 {
+    if (ctx.container_tools) {
+        if (!sandbox.allowsTool(call.name)) return try arena.dupe(u8, "Tool unavailable in the container execution domain; no host tool ran.");
+        if (ctx.container_runtime == null) return try arena.dupe(u8, "Container execution authority is unavailable; no host tool ran.");
+        return null;
+    }
     if (providerDisablesTool(ctx.provider_capabilities, call.name)) {
         return try arena.dupe(u8, "Unsupported tool: vision");
     }
@@ -464,6 +478,11 @@ pub fn executeToolCallAuthorized(
     execution_ctx.command_replay_capture = request.command_replay_capture;
     execution_ctx.command_replay_unavailable = request.command_replay_unavailable;
 
+    // This fence precedes native mutation preparation/application, ordinary
+    // dispatch, dynamic MCP resolution, and all host process paths.
+    if (execution_ctx.container_tools) {
+        return executeContainerToolCall(execution_ctx, request.result_allocator, request.call);
+    }
     const started_at_ms = io_mod.milliTimestamp();
     const uses_file_mutation_contract = if (registeredToolSpec(
         execution_ctx,
@@ -633,10 +652,28 @@ test "executed file mutation failures classify as tool failures, not rejections"
     );
 }
 
+fn executeContainerToolCall(ctx: Context, alloc: Allocator, call: ToolCall) !ToolExecutionResult {
+    if (!sandbox.allowsTool(call.name)) {
+        return semanticFailure(try alloc.dupe(u8, "Tool unavailable in the container execution domain; no host tool ran."));
+    }
+    if (ctx.cancel_flag) |cancel| if (cancel.load(.acquire)) return error.Cancelled;
+    const runtime = ctx.container_runtime orelse
+        return semanticFailure(try alloc.dupe(u8, "Container execution authority is unavailable; no host tool ran."));
+    const result = runtime.executeWithCancel(alloc, call.name, call.arguments_json, ctx.cancel_flag) catch |err| {
+        if (err == error.Canceled) return error.Cancelled;
+        return err;
+    };
+    defer result.deinit(alloc);
+    if (ctx.cancel_flag) |cancel| if (cancel.load(.acquire)) return error.Cancelled;
+    const output = try tool_result_limits.prepareModelOutput(alloc, call.name, result.text, ctx.max_tool_result_bytes);
+    return .{ .status = if (result.success) .success else .failure, .model_output = output };
+}
+
 pub fn executeHostToolCallAuthorized(
     ctx: Context,
     request: tool_contracts.ToolExecutionRequest,
 ) !ToolExecutionResult {
+    if (ctx.container_tools) return executeContainerToolCall(ctx, request.result_allocator, request.call);
     const spec = ctx.tool_registry.lookup(request.call.name) orelse
         return error.InvalidToolArguments;
     if (spec.executor_kind != .host) return error.InvalidToolArguments;
@@ -1706,6 +1743,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .allocator = arena,
         .observer = ctx.observer,
         .permission_mode = ctx.permission_mode,
+        .container_tools = ctx.container_tools,
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.access_scope,
         .change_tracker = ctx.tracker,
@@ -2015,6 +2053,96 @@ test "Vision path preparation reports semantic failure and preserves operational
         error.OutOfMemory,
         visionPathPreparationFailure(alloc, error.OutOfMemory),
     );
+}
+
+test "container domain blocks native mutation and host tool entry points even in full access" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var fixture: TestRuntime = .{ .tool_registry = test_builtin_tools.registry, .permission_mode = .yolo };
+    defer fixture.deinit(std.testing.allocator);
+    var ctx = fixture.context();
+    ctx.container_tools = true;
+    for ([_][]const u8{ "write_file", "edit_file", "read_file", "subagent", "toolbox", "mcp_secret" }) |name| {
+        // Invalid native arguments must never be decoded or prepared first.
+        const call: ToolCall = .{ .id = "container-fence", .name = name, .arguments_json = "{}" };
+        const ordinary = try executeToolCall(ctx, alloc, call);
+        try std.testing.expect(ordinary.status == .failure);
+        try std.testing.expect(std.mem.find(u8, ordinary.model_output, "container execution domain") != null);
+        const host = try executeHostToolCallAuthorized(ctx, .{
+            .call_allocator = alloc,
+            .result_allocator = alloc,
+            .call = call,
+            .authority = .ordinary,
+            .session_grants = &.{},
+            .advertised_dynamic_tool_names = &.{},
+            .max_tool_result_bytes = 64 * 1024,
+        });
+        try std.testing.expect(host.status == .failure);
+        const validation = try validateToolCall(ctx, alloc, call);
+        try std.testing.expect(validation == .failure);
+        var admission = ctx.admissionInput();
+        admission.session_permission_state_provider = null;
+        const permission = try tool_admission.requestPermissionOutcome(admission, alloc, call, .yolo, &.{});
+        try std.testing.expect(permission.tool_failure != null);
+    }
+    const missing = try executeToolCall(ctx, alloc, .{ .id = "missing", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"true\"}" });
+    try std.testing.expect(missing.status == .failure);
+    try std.testing.expect(std.mem.find(u8, missing.model_output, "authority is unavailable") != null);
+}
+
+test "container domain sanitizes and caps output before model projection" {
+    if (comptime !sandbox.supported) return;
+    const Fake = struct {
+        fn run(raw: ?*anyopaque, alloc: Allocator, _: []const []const u8, _: []const u8, _: ?*const std.atomic.Value(bool)) anyerror!sandbox.Result {
+            const text = try alloc.alloc(u8, 4096);
+            @memset(text, 'x');
+            if (raw != null) text[0] = 0xff;
+            return .{ .text = text, .success = true };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var fixture: TestRuntime = .{ .tool_registry = container_tools.advertisement_set.registry, .permission_mode = .yolo };
+    defer fixture.deinit(std.testing.allocator);
+    var runtime = sandbox.Runtime.init(alloc, "/workspace");
+    defer runtime.deinit();
+    runtime.lifecycle = .running;
+    runtime.config_dir = try alloc.dupe(u8, "/not-used");
+    runtime.container_name = try alloc.dupe(u8, "not-used");
+    runtime.container_id = try alloc.dupe(u8, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    runtime.user = try alloc.dupe(u8, "1000:1000");
+    runtime.runner = .{ .run = Fake.run };
+    var ctx = fixture.context();
+    ctx.container_tools = true;
+    ctx.container_runtime = &runtime;
+    ctx.max_tool_result_bytes = 1024;
+    const result = try executeToolCall(ctx, alloc, .{ .id = "cap", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"printf x\"}" });
+    try std.testing.expect(result.status == .success);
+    try std.testing.expect(result.model_output.len <= 1024);
+    try std.testing.expect(std.mem.findScalar(u8, result.model_output, 0x1b) == null);
+    try std.testing.expect(std.mem.find(u8, result.model_output, "truncated") != null);
+    runtime.runner.context = @ptrCast(&runtime);
+    const binary = try executeToolCall(ctx, alloc, .{ .id = "binary", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"printf binary\"}" });
+    try std.testing.expect(binary.status == .success);
+    try std.testing.expectEqualStrings("binary or non-utf8 tool output omitted (4096 bytes)", binary.model_output);
+}
+
+test "container domain cannot run shell before setup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var fixture: TestRuntime = .{ .tool_registry = container_tools.advertisement_set.registry, .permission_mode = .yolo };
+    defer fixture.deinit(std.testing.allocator);
+    var runtime = sandbox.Runtime.init(std.testing.allocator, "/not-a-workspace");
+    defer runtime.deinit();
+    var ctx = fixture.context();
+    ctx.container_tools = true;
+    ctx.container_runtime = &runtime;
+    const result = try executeToolCall(ctx, alloc, .{ .id = "pre-setup", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"touch /tmp/not-on-host\"}" });
+    try std.testing.expect(result.status == .failure);
+    try std.testing.expectEqual(sandbox.State.unconfigured, runtime.state());
 }
 
 fn semanticFailure(output: []const u8) ToolExecutionResult {

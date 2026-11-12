@@ -84,6 +84,8 @@ const test_builtin_gateway = if (std_builtin.is_test)
 else
     struct {};
 const builtin_tools = @import("../../builtins/tools.zig");
+const container_tool_specs = @import("../../builtins/container_tools.zig");
+const sandbox = @import("../sandbox/sandbox.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_projection_mod = @import("../tooling/tool_projection.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
@@ -609,6 +611,10 @@ const AskContext = struct {
     cfg: Config,
     deps: RunDeps,
     workspace_root: []const u8,
+    // Fixed before session construction and never changed by resumed preferences.
+    container_tools: bool = false,
+    container_runtime: ?sandbox.Runtime = null,
+    container_prompt: []const u8 = "",
     workspace_access: workspace_access.WorkspaceAccess = .{},
     api_key: []const u8 = "",
     gateway_team: ?[]const u8 = null,
@@ -713,12 +719,22 @@ const AskContext = struct {
     last_recovery_notice_kind: ?types.RouteRecoveryStatus.Kind = null,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
+        return initForRun(alloc, cfg, deps, workspace_root, false);
+    }
+
+    fn initForRun(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8, container_tools: bool) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
         return .{
             .alloc = alloc,
             .cfg = cfg,
-            .deps = deps,
+            .deps = if (container_tools) blk: {
+                var restricted = deps;
+                restricted.tool_set = container_tool_specs.advertisement_set;
+                break :blk restricted;
+            } else deps,
             .workspace_root = workspace_root,
+            .container_tools = container_tools,
+            .container_runtime = if (container_tools) sandbox.Runtime.init(alloc, workspace_root) else null,
             .model = cfg.default_model,
             .seed_model = cfg.default_model,
             .mode_id = cfg.mode_registry.default_mode_id,
@@ -825,6 +841,8 @@ const AskContext = struct {
             self.alloc.destroy(children);
         }
         self.v2_children = null;
+        if (self.container_runtime) |*runtime| runtime.deinit();
+        if (self.container_prompt.len > 0) self.alloc.free(self.container_prompt);
         self.managed_executions.deinit();
         self.terminal_client.deinit();
         self.workspace_access.deinit(self.alloc);
@@ -1035,6 +1053,7 @@ const AskContext = struct {
     /// Subagents on v2 keep their state in the parent's log (D22). A host
     /// that cannot start leaves them off and says why in the trace, as v1.
     fn startV2SubagentHost(self: *AskContext, v2: *session_adapter.Session) !void {
+        if (self.container_tools) return;
         const children = try self.alloc.create(subagent_child_state.V2Children);
         errdefer self.alloc.destroy(children);
         children.* = subagent_child_state.V2Children.init(self.alloc, v2, self.workspace_root);
@@ -1072,6 +1091,8 @@ const AskContext = struct {
             });
         }
         var tc: tool_runtime.Context = .{
+            .container_tools = self.container_tools,
+            .container_runtime = if (self.container_runtime) |*runtime| runtime else null,
             .workspace_root = self.workspace_root,
             .access_scope = self.workspace_access.scope(self.workspace_root),
             .ignored_list_entries = self.cfg.ignored_list_entries,
@@ -1645,8 +1666,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
 
     var owned_resumed_model: ?[]u8 = null;
     defer if (owned_resumed_model) |model| alloc.free(model);
-    var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
+    var ctx = AskContext.initForRun(alloc, cfg, options.deps, startup.workspace_root, startup.container_tools);
     defer ctx.deinit();
+    if (ctx.container_tools) ctx.container_prompt = try sandbox.bootstrapPrompt(alloc, ctx.workspace_root);
     ctx.use_process_interrupt_flag = options.deps.install_headless_interrupt;
     try ctx.checkCancellation();
     var presenter: ?ask_presentation.Runtime = null;
@@ -1670,7 +1692,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.auto_compact_percent = startup.auto_compact_percent;
     ctx.context_limits = startup.context_limits;
     ctx.context_limits.applyCommandLine(cfg.context_limit_overrides);
-    ctx.toolbox_behind = config_runtime.tool_placement.behindToolbox(startup.tool_placement, cfg.tool_placement_overrides);
+    if (!ctx.container_tools) ctx.toolbox_behind = config_runtime.tool_placement.behindToolbox(startup.tool_placement, cfg.tool_placement_overrides);
     ctx.fast_mode = startup.fast_mode;
     ctx.persisted_ultrafast_mode = startup.configured_ultrafast_mode;
     ctx.ultrafast_mode = startup.ultrafast_mode;
@@ -1682,7 +1704,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.reviewer_model = startup.review_model;
     ctx.mode_id = mode_id;
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
-    ctx.context_enabled = startup.context_enabled;
+    ctx.context_enabled = startup.context_enabled and !ctx.container_tools;
     if (options.output_mode.isTerminal()) {
         presenter = try ask_presentation.Runtime.init(alloc, .{
             .text = owned_prompt,
@@ -1690,7 +1712,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         }, options.output_mode == .terminal_no_color);
         ctx.presenter = &presenter.?;
     }
-    try ctx.configureNotifications(
+    if (!ctx.container_tools) try ctx.configureNotifications(
         startup.notification_turn_end,
         startup.notification_attention_required,
     );
@@ -1819,7 +1841,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
     try ctx.checkCancellation();
-    ctx.loaded_skills = try options.deps.load_skills(
+    if (!ctx.container_tools) ctx.loaded_skills = try options.deps.load_skills(
         alloc,
         startup.workspace_root,
         cfg.skill_root_policy,
@@ -1829,7 +1851,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     skill_runtime.traceDiagnostics("ask_startup", loaded_skills.diagnostics);
     ctx.skills_dir = loaded_skills.dir;
     loaded_skills.dir = &.{};
-    if (startup.context_enabled) {
+    if (ctx.context_enabled) {
         try ctx.checkCancellation();
         ctx.context_snapshot = try ctx.deps.context_registry.gatherDefaultSnapshot(alloc, .{
             .workspace_root = startup.workspace_root,
@@ -1841,13 +1863,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
 
     try ctx.checkCancellation();
-    if (options.deps.load_mcp_host) |load_host| {
+    if (!ctx.container_tools) if (options.deps.load_mcp_host) |load_host| {
         ctx.mcp_host = try load_host(alloc, startup.workspace_root, ctx.toolRegistry(), .{ .questions = ctx.mcp_elicitation_capabilities });
         if (ctx.mcp_host) |h| try reportUnapprovedMcpServers(&ctx, h);
-    }
+    };
     try ctx.checkCancellation();
     const session_child_capability = ctx.sessionChildCapability();
-    var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, .{
+    var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, ctx.deps.tool_set, ctx.mode_id, .{
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
@@ -1892,7 +1914,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     try ctx.checkCancellation();
     const title_task = maybeStartAskTitleTask(
         &ctx,
-        startup.session_title_generation,
+        startup.session_title_generation and !ctx.container_tools,
         owned_prompt,
         options.save_session and ctx.requested_resume == null,
     );
@@ -1901,8 +1923,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer toolbox_arena_state.deinit();
     const toolbox_mcp_servers = try toolboxMcpServerNames(toolbox_arena_state.allocator(), &ctx);
     const turn_config: agent_runtime.Config = .{
-        .system_prompt = cfg.prompt_policy.system_prompt,
-        .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
+        .system_prompt = if (ctx.container_tools) ctx.container_prompt else cfg.prompt_policy.system_prompt,
+        .model_prompt_overlay = if (ctx.container_tools) "" else cfg.prompt_policy.modelPromptOverlay(ctx.model),
         .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
         .toolbox_mcp_servers = toolbox_mcp_servers,
         .toolbox_behind = ctx.toolbox_behind.slice(),
@@ -2324,6 +2346,7 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
 
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.container_tools) return;
     try ctx.deps.context_registry.appendDefaultTransient(.{
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
@@ -2334,6 +2357,7 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
 
 fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.container_tools) return;
     try ctx.deps.context_registry.appendDefaultStatic(.{
         .project_context = ctx.modelVisibleProjectContext(),
     }, arena, messages);
@@ -2355,6 +2379,7 @@ fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8
 
 fn resolveUnselectedMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.container_tools) return null;
     return tool_runtime.resolveUnselectedMcpTool(ctx.toolContext(), arena, name);
 }
 
@@ -2677,6 +2702,7 @@ fn lifecycleDynamicMcpToolAvailable(ctx: *AskContext, name: []const u8, advertis
 }
 
 fn lifecycleDynamicMcpAvailability(ctx: *AskContext) tool_mcp_runtime.RuntimeCapabilities {
+    if (ctx.container_tools) return .{};
     if (ctx.mcp_host) |h| return h.catalog.runtimeCapabilities();
     return .{};
 }
@@ -4930,6 +4956,84 @@ fn testPermissionRuleSet(alloc: Allocator, permission: []const u8, pattern: []co
         .action = action,
     };
     return rules;
+}
+
+test "CLI container tools isolate startup, context, and tool advertisement" {
+    const Fixture = struct {
+        fn startup(alloc: Allocator, transport: oauth_transport.Provider, store: host.SecretStore, model: []const u8, steps: usize, _: ?model_provider.ProviderId, _: ?[]const u8, _: []const config_runtime.SettingOverride) !app_lifecycle.StartupState {
+            var state = try testPresentKeyStartup(alloc, transport, store, model, steps, null, null, &.{});
+            errdefer state.deinit(alloc);
+            const root = try io_mod.realpathAlloc(alloc, ".");
+            alloc.free(state.workspace_root);
+            state.workspace_root = root;
+            state.container_tools = true;
+            return state;
+        }
+
+        fn skills(_: Allocator, _: []const u8, _: skill_contract.RootPolicy) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills {
+            return error.OutOfMemory;
+        }
+
+        fn mcp(_: Allocator, _: []const u8, _: tool_dispatch.Registry, _: mcp_host.Extras) anyerror!?*mcp_host.Host {
+            return error.TestUnexpectedMcpStartup;
+        }
+
+        fn process(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, _: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+            const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
+            try std.testing.expect(ctx.container_tools);
+            try std.testing.expect(ctx.container_runtime != null);
+            try std.testing.expect(!ctx.context_enabled);
+            try std.testing.expect(ctx.mcp_host == null);
+            try std.testing.expect(ctx.subagent_host == null);
+            try std.testing.expect(ctx.notification_player == null);
+            try std.testing.expectEqual(@as(usize, 0), cfg.skill_catalog.skills.len);
+            try std.testing.expectEqual(@as(usize, 0), cfg.toolbox_mcp_servers.len);
+            try std.testing.expectEqual(@as(usize, 2), cfg.advertised_tool_names.len);
+            for (cfg.advertised_tool_names) |name| {
+                try std.testing.expect(std.mem.eql(u8, name, "shell") or std.mem.eql(u8, name, "container_setup"));
+            }
+            try std.testing.expectEqualStrings(ctx.container_prompt, cfg.system_prompt);
+            try std.testing.expect(ctx.container_prompt.len > 0);
+            const tool_ctx = ctx.toolContext();
+            try std.testing.expect(tool_ctx.container_tools);
+            try std.testing.expect(tool_ctx.container_runtime == &ctx.container_runtime.?);
+            try std.testing.expectEqual(@as(usize, 2), tool_ctx.tool_registry.tools.len);
+            var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+            defer arena.deinit();
+            var messages: std.ArrayList(ChatMessage) = .empty;
+            try appendStaticContext(ctx, arena.allocator(), &messages);
+            try appendRuntimeContext(ctx, arena.allocator(), &messages);
+            try std.testing.expectEqual(@as(usize, 0), messages.items.len);
+            try testPushAssistantText(deps, "isolated");
+            const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+                .turn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("inspect") },
+                    .assistant = @constCast("isolated"),
+                } },
+                .terminal_outcome = .completed,
+            });
+            try deps.push_event(deps.ctx, .{ .finish_prompt = finished });
+        }
+    };
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, Fixture.startup);
+    deps.load_skills = Fixture.skills;
+    deps.load_mcp_host = Fixture.mcp;
+    deps.context_registry = test_cli_context_registry;
+    deps.process_queued_prompt = Fixture.process;
+    const result = try runPromptInternal(alloc, "inspect", null, testConfig(), .{
+        .output_mode = .json,
+        .save_session = false,
+        .deps = deps,
+    });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("isolated", result.assistant_output);
+    try std.testing.expectEqualStrings("isolated", result.final_output);
 }
 
 test "CLI lifecycle action preserves dynamic MCP availability boundaries" {

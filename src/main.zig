@@ -128,6 +128,8 @@ const tool_projection = @import("core/tooling/tool_projection.zig");
 const command_output_content = @import("core/tooling/command_output_content.zig");
 const tool_dispatch = @import("core/tooling/tool_dispatch.zig");
 const tool_set_contract = @import("core/tooling/tool_set.zig");
+const sandbox = @import("core/sandbox/sandbox.zig");
+const container_tool_set = @import("builtins/container_tools.zig");
 const tool_mcp_runtime = @import("core/tooling/tool_mcp_runtime.zig");
 const tool_runtime = @import("core/tooling/tool_runtime.zig");
 const web_fetch_runtime = @import("core/tooling/web_fetch_runtime.zig");
@@ -454,8 +456,14 @@ const App = struct {
         return null;
     }
 
-    pub fn promptPolicy(_: *const Self, agent: *const agents.Agent) prompt_policy.Policy {
+    pub fn promptPolicy(self: *const Self, agent: *const agents.Agent) prompt_policy.Policy {
         var policy = builtin_context.prompt_policy;
+        if (self.container_tools) {
+            policy.system_prompt = self.container_prompt orelse "Container tools are unavailable. Do not run host tools.";
+            policy.embedded_system_prompt = null;
+            policy.model_prompt_overlay_fn = null;
+            return policy;
+        }
         if (agent.profile.system_prompt) |system_prompt| policy.system_prompt = system_prompt;
         return policy;
     }
@@ -543,6 +551,9 @@ const App = struct {
     }
 
     alloc: Allocator,
+    container_tools: bool = false,
+    container_runtime: ?*sandbox.Runtime = null,
+    container_prompt: ?[]u8 = null,
     terminal: TerminalState = .{},
 
     auth: auth_runtime.Runtime = auth_runtime.Runtime.init(
@@ -753,6 +764,14 @@ const App = struct {
             },
         );
         errdefer app.deinit();
+        if (app.container_tools) {
+            if (comptime build_options.libfx or host_target.is_wasm) return error.ContainerToolsUnsupportedHost;
+            const runtime = try alloc.create(sandbox.Runtime);
+            runtime.* = sandbox.Runtime.init(alloc, app.workspace_root);
+            app.container_runtime = runtime;
+            app.container_prompt = try sandbox.bootstrapPrompt(alloc, app.workspace_root);
+            app.context_enabled = false;
+        }
         if (launch.modifiers.profile_name != null) try ProfileAppRuntime.applyLaunchMode(&app);
         // The first instance is launched; startup opens the rest once the
         // app has its final address.
@@ -831,6 +850,7 @@ const App = struct {
     }
 
     pub fn configureNotifications(self: *App, agent: *agents.Agent) !void {
+        if (self.container_tools) return;
         // Register herdr hooks before NotificationAppRuntime.configure freezes
         // the lifecycle runtime (its call to freeze() is the sole freeze site).
         try HerdrAppRuntime.configure(self, SessionAppRuntime.activeSessionId(agent));
@@ -1009,6 +1029,7 @@ const App = struct {
         AgentsAppRuntime.liftResumeIntent(self);
         // Children close first: they borrow main's session store.
         AgentsAppRuntime.shutdownChildren(self);
+        self.closeContainerTools();
         // The resume command is the first instance's, or the launched
         // instance's the user quit from, which its teardown kept.
         const resume_handoff = SessionAppRuntime.finalizePersistenceWithResumeHandoff(self, main_agent) orelse
@@ -1037,6 +1058,18 @@ const App = struct {
 
     pub fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
         return ui_render.formatResumeHandoff(buffer, session_id);
+    }
+
+    fn closeContainerTools(self: *App) void {
+        if (self.container_runtime) |runtime| {
+            runtime.deinit();
+            self.alloc.destroy(runtime);
+            self.container_runtime = null;
+        }
+        if (self.container_prompt) |prompt| {
+            self.alloc.free(prompt);
+            self.container_prompt = null;
+        }
     }
 
     /// Full teardown for hosts that keep running after the shell ends, such as
@@ -1088,6 +1121,7 @@ const App = struct {
         InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
         // Children close first: they borrow main's session store.
         AgentsAppRuntime.shutdownChildren(self);
+        self.closeContainerTools();
         SessionAppRuntime.finalizePersistence(self, main_agent);
         shutdown_trace.mark("persistence_finalized");
         main_agent.worker.deinit(std.heap.c_allocator);
@@ -1849,6 +1883,7 @@ const App = struct {
     }
 
     pub fn loadMcpHost(self: *App, agent: *agents.Agent, load: mcp_host.LoadFn) !void {
+        if (self.container_tools) return;
         try self.mcp.loadHost(load, self.alloc, io_mod.homeDir(), self.workspace_root, self.toolRegistry(agent), .{ .form = true, .url = true });
     }
 
@@ -1911,6 +1946,7 @@ const App = struct {
     }
 
     fn refreshMcpHostFromFiles(self: *App, agent: *agents.Agent) bool {
+        if (self.container_tools) return false;
         return self.mcp.refreshHost(self.alloc, io_mod.homeDir(), self.workspace_root, self.toolRegistry(agent), .files);
     }
 
@@ -1920,6 +1956,7 @@ const App = struct {
     /// turn of any of them keeps the servers it has; the next prompt after
     /// it picks the change up. True when it loaded.
     pub fn refreshMcpHostForPrompt(self: *App, agent: *agents.Agent) bool {
+        if (self.container_tools) return false;
         if (AgentsAppRuntime.anyWorkGoing(self)) return false;
         return self.refreshMcpHostFromFiles(agent);
     }
@@ -1929,6 +1966,7 @@ const App = struct {
     }
 
     fn effectiveToolSet(self: *const App, agent: *const agents.Agent) tool_set_contract.ToolSet {
+        if (self.container_tools) return container_tool_set.advertisement_set;
         if (comptime host_profile.tools) {
             return agent.profile_tools orelse builtin_tools.advertisement_set;
         }
@@ -1949,6 +1987,7 @@ const App = struct {
     /// fx's tools before any agent profile narrows them: what a profile that
     /// sets tools chooses from.
     pub fn baseToolSet(self: *const App) tool_set_contract.ToolSet {
+        if (self.container_tools) return container_tool_set.advertisement_set;
         if (comptime host_profile.tools) return builtin_tools.advertisement_set;
         return browser_workspace_tools.selectToolSet(false, self.workspaceHostInfo() != null);
     }
@@ -2288,6 +2327,7 @@ const App = struct {
     }
 
     pub fn resolveUnselectedMcpTool(self: *App, agent: *agents.Agent, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+        if (self.container_tools) return null;
         return AgentAppRuntime.resolveUnselectedMcpTool(self, agent, arena, name, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 

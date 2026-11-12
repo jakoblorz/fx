@@ -129,6 +129,7 @@ const Writable = enum {
     collapse_tool_calls,
     context,
     effort,
+    @"experimental.container_tools",
     fast_mode,
     max_agent_steps,
     max_tool_result_bytes,
@@ -232,6 +233,7 @@ pub fn change(options: Options, problem: *WriteProblem) error{ RefusedConfigSett
         .collapse_tool_calls => patch.collapse_tool_calls = enabled,
         .context => patch.context = enabled,
         .fast_mode => patch.fast_mode = enabled,
+        .@"experimental.container_tools" => patch.container_tools = enabled,
         .@"prompt_history.enabled" => patch.prompt_history_enabled = enabled,
         .provider_strict => patch.provider_strict = enabled,
         .session_titles => patch.session_titles = enabled,
@@ -289,6 +291,7 @@ fn ownerHint(key: []const u8) []const u8 {
         .{ .keys = &.{ "yolo_acknowledged", "fast_mode_model_bound", "skill_match_fuzzy" }, .hint = "fx manages it" },
         .{ .keys = &.{"status_line"}, .hint = "set status_line.context, status_line.session, or status_line.workspace" },
         .{ .keys = &.{"sound"}, .hint = "set sound.turn_end, sound.attention_required, or sound.max" },
+        .{ .keys = &.{"experimental"}, .hint = "set experimental.container_tools" },
         .{ .keys = &.{"prompt_history"}, .hint = "set prompt_history.enabled" },
         .{ .keys = &.{"tool_placement"}, .hint = "set tool_placement.<tool> to toolbox or direct, for one of " ++ config_runtime.tool_placement.movable_list },
     };
@@ -449,16 +452,16 @@ pub const Effective = union(enum) {
 /// The keys `fx config` reads from the resolved state instead of the files.
 /// A test checks that each plain key is here or in `files_only_keys`.
 pub const resolved_keys = [_][]const u8{
-    "auto_compact_percent",     "auto_upgrade",           "cache_warming",
-    "collapse_tool_calls",      "context",                "effort",
-    "fast_mode",                "first_call_tool_choice", "max_agent_steps",
-    "max_tool_result_bytes",    "permission_mode",        "prompt_history.enabled",
-    "provider",                 "provider_order",         "provider_strict",
-    "review_model",             "session_titles",         "slash_menu_categories",
-    "sound.attention_required", "sound.max",              "sound.turn_end",
-    "startup_scrollback",       "status_line.context",    "status_line.session",
-    "status_line.workspace",    "theme",                  "ultrafast_mode",
-    "update_channel",
+    "auto_compact_percent",     "auto_upgrade",                 "cache_warming",
+    "collapse_tool_calls",      "context",                      "effort",
+    "fast_mode",                "first_call_tool_choice",       "max_agent_steps",
+    "max_tool_result_bytes",    "permission_mode",              "prompt_history.enabled",
+    "provider",                 "provider_order",               "provider_strict",
+    "review_model",             "session_titles",               "slash_menu_categories",
+    "sound.attention_required", "sound.max",                    "sound.turn_end",
+    "startup_scrollback",       "status_line.context",          "status_line.session",
+    "status_line.workspace",    "theme",                        "ultrafast_mode",
+    "update_channel",           "experimental.container_tools",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -488,6 +491,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "context")) return boolean(state.context_enabled);
     if (eql(u8, key, "effort")) return string(state.effort.label());
     if (eql(u8, key, "fast_mode")) return boolean(state.fast_mode);
+    if (eql(u8, key, "experimental.container_tools")) return boolean(state.container_tools);
     if (eql(u8, key, "first_call_tool_choice")) return string(state.first_call_tool_choice.label());
     if (eql(u8, key, "max_agent_steps")) return integer(arena, state.agent_step_limit);
     if (eql(u8, key, "max_tool_result_bytes")) return integer(arena, state.max_tool_result_bytes);
@@ -1049,4 +1053,36 @@ test "a step count past a JSON integer is shown, not cast" {
     defer arena_state.deinit();
     const effective = try integer(arena_state.allocator(), std.math.maxInt(usize));
     try std.testing.expectEqualStrings("18446744073709551615", effective.value.number_string);
+}
+
+test "container tools config supports set unset one run and effective values" {
+    const key = "experimental.container_tools";
+    var problem: WriteProblem = .none;
+    const planned = try changeForTest(&.{ "set", key, "on" }, &problem);
+    try std.testing.expect(planned.patch.container_tools.?);
+    try std.testing.expect(planned.value.?.bool);
+    const removed = try changeForTest(&.{ "unset", key }, &problem);
+    try std.testing.expectEqualStrings(key, removed.patch.remove.?);
+    var override_problem: OverrideProblem = .none;
+    const override = try parseOverride("experimental.container_tools=false", &override_problem);
+    try std.testing.expectEqualStrings(key, override.key);
+    try std.testing.expect(!override.value.bool);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var state: app_lifecycle.StartupState = .{ .agent_step_limit = 25 };
+    var detailed: config_runtime.DetailedSettings = .{ .settings = .{} };
+    try app_lifecycle.resolveSettings(arena.allocator(), &state, &detailed);
+    const initial = try effectiveValue(std.testing.allocator, &state, .gateway, key);
+    try std.testing.expect(!initial.value.bool);
+    detailed.settings.container_tools = true;
+    try app_lifecycle.resolveSettings(arena.allocator(), &state, &detailed);
+    const enabled = try effectiveValue(std.testing.allocator, &state, .gateway, key);
+    try std.testing.expect(enabled.value.bool);
+    var serialized: std.Io.Writer.Allocating = .init(arena.allocator());
+    try std.json.Stringify.value(enabled.value, .{}, &serialized.writer);
+    try std.testing.expectEqualStrings("true", serialized.written());
+    const entries = try effectiveEntries(arena.allocator(), &state, .gateway, &.{.{ .key = key, .value = .{ .bool = true }, .origin = .global }});
+    try std.testing.expectEqualStrings(key, entries[0].key);
+    try std.testing.expect(entries[0].value.bool);
+    try std.testing.expectEqual(settings_entries.Origin.global, entries[0].origin);
 }

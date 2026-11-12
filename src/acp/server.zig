@@ -2887,6 +2887,12 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         });
     };
     defer startup.deinit(alloc);
+    if (startup.container_tools) {
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "experimental.container_tools is not supported by ACP; use fx ask instead",
+        });
+    }
     if (state.cfg.auth_mode == .local and startup.credential == null and
         !(startup.provider == .gateway and state.cfg.credential_override != null))
     {

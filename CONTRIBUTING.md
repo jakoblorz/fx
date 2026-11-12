@@ -80,6 +80,10 @@ bun test cli.test.ts
 
 Zig unit tests sit in `test` blocks inside the source file they cover, and `zig build test` runs all of them. CI checks formatting with `zig fmt --check src/`. The end-to-end tests run the binary at `zig-out/bin/fx`, so build before you run them. Run only the end-to-end files that cover your change, because CI runs the whole suite on every push. The `tui-*` files drive fx inside tmux.
 
+### Test container-only tools
+
+The native container experiment has a focused unit target: `zig build test-container-tools`. Run it with `umask 022` so private-profile fixtures are not group-writable. After building fx, run `FX_SOUND=0 bun test container-tools.test.ts` from `tests/e2e/` for deterministic isolation checks. Add `FX_TEST_CONTAINER_DOCKER=1` to exercise Dockerfile setup and repository writes against a real local Docker daemon; this opt-in can pull a base image. [Container tools decisions](CONTAINER_TOOLS.md) records the experiment's scope, constraints, and verification.
+
 ### Add an end-to-end test file
 
 Every root `tests/e2e/*.test.ts` file needs an entry in the first three files below, and in the fourth only when it branches on the platform. CI fails when a required entry is missing or stale:

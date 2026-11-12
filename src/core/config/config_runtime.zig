@@ -66,6 +66,8 @@ pub const Settings = struct {
     provider_strict: ?bool = null,
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
+    /// Opt in to container tools. Profile-only and off by default.
+    container_tools: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
     theme: ?[]const u8 = null,
@@ -153,6 +155,7 @@ pub const ConfigSources = struct {
     fast_mode_model_bound: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
     collapse_tool_calls: ConfigSource = .compiled_default,
+    container_tools: ConfigSource = .compiled_default,
     startup_scrollback: ConfigSource = .compiled_default,
     prompt_history_enabled: ConfigSource = .compiled_default,
     statusline_context: ConfigSource = .compiled_default,
@@ -906,6 +909,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.fast_mode_model_bound != null) sources.fast_mode_model_bound = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
+    if (settings.container_tools != null) sources.container_tools = source;
     if (settings.session_titles != null) sources.session_titles = source;
     if (settings.cache_warming != null) sources.cache_warming = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
@@ -1819,6 +1823,14 @@ fn parseProfileOnlyFields(
         settings.collapse_tool_calls = value.bool;
     }
 
+    if (root.object.get("experimental")) |experimental| {
+        if (experimental != .object) return error.InvalidExperimentalType;
+        if (experimental.object.get("container_tools")) |value| {
+            if (value != .bool) return error.InvalidContainerToolsType;
+            settings.container_tools = value.bool;
+        }
+    }
+
     if (root.object.get("session_titles")) |session_titles_value| {
         const value = session_titles_value;
         if (value != .bool) return error.InvalidSessionTitlesType;
@@ -2064,6 +2076,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.provider_strict) |value| target.provider_strict = value;
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
     if (incoming.collapse_tool_calls) |value| target.collapse_tool_calls = value;
+    if (incoming.container_tools) |value| target.container_tools = value;
     if (incoming.session_titles) |value| target.session_titles = value;
     if (incoming.cache_warming) |value| target.cache_warming = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
@@ -5001,4 +5014,38 @@ test "the settings list names every value the settings enums accept" {
     }
     for (std.meta.tags(tool_placement.Placement)) |placement| try std.testing.expect(listed.has("tool_placement", @tagName(placement)));
     try std.testing.expectEqual(std.meta.tags(tool_placement.Placement).len, settings_keys.find("tool_placement").?.values.len);
+}
+
+test "container tools experiment parses merges and stays profile only" {
+    const alloc = std.testing.allocator;
+    var absent = try parseSettingsJson(alloc, "{}");
+    defer absent.deinit(alloc);
+    try std.testing.expect(absent.container_tools == null);
+    try std.testing.expect(!(absent.container_tools orelse false));
+    var enabled = try parseSettingsJson(alloc, "{\"experimental\":{\"container_tools\":true}}");
+    defer enabled.deinit(alloc);
+    try std.testing.expect(enabled.container_tools.?);
+    var disabled = try parseSettingsJson(alloc, "{\"experimental\":{\"container_tools\":false}}");
+    defer disabled.deinit(alloc);
+    try mergeSettings(&enabled, &absent, alloc);
+    try std.testing.expect(enabled.container_tools.?);
+    try mergeSettings(&enabled, &disabled, alloc);
+    try std.testing.expect(!enabled.container_tools.?);
+    var sources: ConfigSources = .{};
+    updateConfigSources(&sources, enabled, .user_workspace);
+    try std.testing.expectEqual(ConfigSource.user_workspace, sources.container_tools);
+    for ([_][]const u8{
+        "{\"experimental\":{\"container_tools\":true}}",
+        "{\"experimental\":{\"container_tools\":\"true\"}}",
+        "{\"experimental\":true}",
+    }) |text| {
+        var project = try parseSettingsJsonForLayer(alloc, text, .project);
+        defer project.deinit(alloc);
+        try std.testing.expect(project.container_tools == null);
+    }
+    try std.testing.expect(settings_keys.ignoredInProject("experimental"));
+    try std.testing.expectError(error.InvalidExperimentalType, parseSettingsJson(alloc, "{\"experimental\":true}"));
+    try std.testing.expectError(error.InvalidContainerToolsType, parseSettingsJson(alloc, "{\"experimental\":{\"container_tools\":\"true\"}}"));
+    try applySettingOverrides(alloc, &enabled, &.{.{ .key = "experimental.container_tools", .value = .{ .bool = true } }});
+    try std.testing.expect(enabled.container_tools.?);
 }

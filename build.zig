@@ -114,6 +114,13 @@ pub fn build(b: *std.Build) void {
     test_paths.addOptionPathUntracked("source_root", b.path("src"));
     const test_paths_module = test_paths.createModule();
     exe.root_module.addImport("test_paths", test_paths_module);
+    const container_tests = b.addTest(.{
+        .root_module = exe.root_module,
+        .filters = &.{ "container", "sandbox" },
+    });
+    const run_container_tests = b.addRunArtifact(container_tests);
+    run_container_tests.step.dependOn(b.getInstallStep());
+    b.step("test-container-tools", "Run the native container experiment's focused tests").dependOn(&run_container_tests.step);
     // The unit tests for the Linux PGSO step that relinks them from
     // transformed code. It builds them position independent: a test there
     // defines the wasm host's `extern "fx"` functions itself, and Zig rejects
